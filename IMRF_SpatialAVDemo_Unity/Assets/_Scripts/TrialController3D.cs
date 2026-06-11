@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Threading.Tasks;
 using LSL;
+#if UNITY_EDITOR
 using UnityEditor;
+#endif
 using UnityEngine;
 using UnityEngine.InputSystem;
 using UnityEngine.Serialization;
@@ -14,6 +17,24 @@ using TaskDef = TrialDefGenerator.TaskDef;
 //[RequireComponent(typeof(SendOSCMessage))]
 public class TrialController3D : MonoBehaviour
 {
+    private const string StreamName = "AV_Localization";
+    private const string StreamType = "Markers";
+    // Keep the stream name stable for LabRecorder, but make the source_id unique per
+    // run so pylsl does not reconnect to stale empty outlets from earlier Unity runs.
+    private const string StreamSourceIdPrefix = "IMRF_2026_SpatialAV_Unity_AV_Localization_Int32";
+
+    private const int LslCodeUnknownStatus = 990;
+    private const int LslCodeReady = 900;
+    private const int LslCodeRunning = 902;
+    private const int LslCodeBlockStart = 910;
+    private const int LslCodeBlockEnd = 911;
+    private const int LslCodeTrialStart = 912;
+    private const int LslCodeStop = 997;
+    private const int LslCodeFinished = 998;
+    private const int LslCodeClosed = 999;
+
+    private static TrialController3D activeController;
+
     public AudioManager audioManager;
     public SpeakerPositioning SpeakerPositioning;
     public InstructionDisplay InstructionDisplay;
@@ -33,12 +54,9 @@ public class TrialController3D : MonoBehaviour
 
     public TrialDefGenerator.ExperimentType ExperimentType;
     private readonly float InterBlockBreakTime = 10f;
-    private readonly string[] lsl_sample = { "" };
+    private readonly int[] lsl_sample = { 0 };
 
 
-    private readonly string StreamName = "AV_Localization";
-
-    private readonly string StreamType = "Markers";
     // public GameObject target;
 
     //private SendOSCMessage _sendOscMessage;
@@ -57,7 +75,14 @@ public class TrialController3D : MonoBehaviour
     private FrameData frameData;
     private bool isCoroutineRunning = false; // Flag to prevent multiple coroutines from overlapping
     private StreamOutlet lsl_outlet;
+    private bool lslReady;
+    private string lslStreamSourceId;
     private double reactATimestamp;
+    private bool hasSentClosedMarker;
+    private bool ownsControllerSlot;
+    private bool startPromptShown;
+    private int lslSampleCount;
+    private InputActionMap experimentControlActions;
 
     // public HeadScript head;
     //private SendOSCMessage sendOSCMessage;
@@ -68,6 +93,9 @@ public class TrialController3D : MonoBehaviour
 
     private int trialCountInBlock = -1;
     private int trialCountInExpt = -1;
+    private int lslBlockNumber = 1;
+    private int lslTrialNumber = 0;
+    private int lslTrialInBlockNumber = 0;
 
     private TrialData trialData;
     private string trialState, prevTrialState;
@@ -83,6 +111,15 @@ public class TrialController3D : MonoBehaviour
 
     private void Awake()
     {
+        if (activeController != null && activeController != this)
+        {
+            Debug.LogWarning("Duplicate TrialController3D detected; disabling this instance to keep one Unity LSL outlet.");
+            enabled = false;
+            return;
+        }
+
+        activeController = this;
+        ownsControllerSlot = true;
         InputSystem.pollingFrequency = 1000;
     }
 
@@ -90,6 +127,11 @@ public class TrialController3D : MonoBehaviour
     {
         //_sendOscMessage = GetComponent<SendOSCMessage>();
         Application.targetFrameRate = frameRate;
+
+        foreach (GameObject go in VisualTargets) go.SetActive(false);
+        FixationTarget.SetActive(false);
+        InstructionDisplay = global::InstructionDisplay.GetOrCreateDefault(InstructionDisplay);
+        startPromptShown = false;
 
         SpeakerPositioning.LoadSpeakersFromCsv();
 
@@ -107,32 +149,187 @@ public class TrialController3D : MonoBehaviour
         stateInitialized = false;
         blockEndInitialized = false;
 
-        //Setting up LSL connection
-        Hash128 osc_hash = new();
-        osc_hash.Append(StreamName);
-        osc_hash.Append(StreamType);
-        StreamInfo streamInfo = new(StreamName, StreamType, 1, LSL.LSL.IRREGULAR_RATE,
-            channel_format_t.cf_string, osc_hash.ToString());
-        lsl_outlet = new StreamOutlet(streamInfo);
+        InitLSL();
 
-        foreach (GameObject go in VisualTargets) go.SetActive(false);
-        FixationTarget.SetActive(false);
+        if (InputSystem.actions != null)
+        {
+            experimentControlActions = InputSystem.actions.FindActionMap("Experiment Control");
+            experimentControlActions?.Enable();
+            confirmAction = experimentControlActions?.FindAction("Confirm");
+            cancelAction = experimentControlActions?.FindAction("Cancel");
+            reactAAction = experimentControlActions?.FindAction("React A");
+            reactBAction = experimentControlActions?.FindAction("React B");
+        }
+        else
+        {
+            Debug.LogWarning("Project-wide Input System actions are unavailable. Falling back to direct keyboard input.");
+        }
 
-        confirmAction = InputSystem.actions.FindAction("Confirm");
-        cancelAction = InputSystem.actions.FindActionMap("Experiment Control").FindAction("Cancel");
-        reactAAction = InputSystem.actions.FindActionMap("Experiment Control").FindAction("React A");
-        reactBAction = InputSystem.actions.FindActionMap("Experiment Control").FindAction("React B");
-
-        reactAAction.started += context => reactATimestamp = context.time;
+        if (reactAAction != null) reactAAction.started += context => reactATimestamp = context.time;
     }
 
     private async void Update()
     {
         await HandleState(); // Handles the current trial state logic - all actual stimulus control, timing, etc, should be handled here
 
-        if (cancelAction.IsPressed()) Application.Quit(); // Quit the application when the Escape key is pressed
+        if (IsCancelPressed()) Application.Quit(); // Quit the application when the Escape key is pressed
+
+        if (reactAAction == null && Keyboard.current != null && Keyboard.current.aKey.wasPressedThisFrame)
+            reactATimestamp = Time.timeAsDouble;
 
         if (frameData != null && CurrentTrialDef != null) StartCoroutine(frameData.AppendDataToBuffer());
+    }
+
+    private bool IsConfirmPressed()
+    {
+        if (confirmAction != null && confirmAction.WasPressedThisFrame()) return true;
+
+        return Keyboard.current != null && Keyboard.current.spaceKey.wasPressedThisFrame;
+    }
+
+    private bool IsCancelPressed()
+    {
+        if (cancelAction != null && cancelAction.WasPressedThisFrame()) return true;
+
+        return Keyboard.current != null && Keyboard.current.escapeKey.wasPressedThisFrame;
+    }
+
+    private void InitLSL()
+    {
+        lslReady = false;
+
+        try
+        {
+            Debug.Log("LSL native library loaded. liblsl version: " + LSL.LSL.library_version());
+            lslStreamSourceId = StreamSourceIdPrefix + "_" + Guid.NewGuid().ToString("N").Substring(0, 8);
+            Debug.Log("Unity LSL source ID: " + lslStreamSourceId);
+            StreamInfo streamInfo = new(StreamName, StreamType, 1, LSL.LSL.IRREGULAR_RATE,
+                channel_format_t.cf_int32, lslStreamSourceId);
+            lsl_outlet = new StreamOutlet(streamInfo, chunk_size: 1);
+            lslReady = true;
+            PushLslMarker("STATUS:READY");
+        }
+        catch (DllNotFoundException e)
+        {
+            Debug.LogWarning("LSL native library was not found. The experiment will continue without LSL markers. " +
+                             e.Message);
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("Could not initialize LSL markers. The experiment will continue without LSL markers. " +
+                             e.Message);
+        }
+    }
+
+    private void PushLslMarker(string marker)
+    {
+        if (!lslReady || lsl_outlet == null || string.IsNullOrEmpty(marker)) return;
+
+        try
+        {
+            lsl_sample[0] = MarkerCode(marker);
+            lsl_outlet.push_sample(lsl_sample);
+            lslSampleCount++;
+            Debug.Log("LSL marker sent: " + marker + " -> " + lsl_sample[0]);
+        }
+        catch (Exception e)
+        {
+            lslReady = false;
+            Debug.LogWarning("Could not send LSL marker. Disabling LSL markers for this run. " + e.Message);
+        }
+    }
+
+    private static string MarkerValue(object value)
+    {
+        if (value == null) return "none";
+
+        return value.ToString()
+            .Replace("|", "_")
+            .Replace("=", "_")
+            .Replace(";", "_");
+    }
+
+    private static string NullableIntValue(int? value)
+    {
+        return value.HasValue ? value.Value.ToString() : "none";
+    }
+
+    private static int MarkerCode(string marker)
+    {
+        if (string.IsNullOrEmpty(marker)) return LslCodeUnknownStatus;
+
+        if (marker.StartsWith("LSL_", StringComparison.OrdinalIgnoreCase) &&
+            int.TryParse(marker.Substring(4), out int lslCode))
+            return lslCode;
+
+        string[] parts = marker.Split('|');
+        string firstPart = parts[0];
+        if (int.TryParse(firstPart, out int numericCode))
+            return numericCode;
+
+        if (firstPart.StartsWith("STATUS:", StringComparison.Ordinal))
+        {
+            if (firstPart == "STATUS:READY") return LslCodeReady;
+            if (firstPart == "STATUS:RUNNING" || firstPart == "STATUS:START") return LslCodeRunning;
+            if (firstPart.StartsWith("STATUS:BLOCK_START:", StringComparison.Ordinal)) return LslCodeBlockStart;
+            if (firstPart.StartsWith("STATUS:BLOCK_END:", StringComparison.Ordinal)) return LslCodeBlockEnd;
+            if (firstPart == "STATUS:STOP") return LslCodeStop;
+            if (firstPart == "STATUS:FINISHED") return LslCodeFinished;
+            if (firstPart == "STATUS:CLOSED") return LslCodeClosed;
+            return LslCodeUnknownStatus;
+        }
+
+        string eventName = "";
+        string triggerCode = "";
+        foreach (string part in parts)
+        {
+            string[] kv = part.Split(new[] { '=' }, 2);
+            if (kv.Length != 2) continue;
+            if (kv[0] == "event") eventName = kv[1];
+            if (kv[0] == "trigger_code") triggerCode = kv[1];
+        }
+
+        if (eventName == "TRIAL_START") return LslCodeTrialStart;
+        if (eventName == "STIM_ON" && int.TryParse(triggerCode, out int stimCode)) return stimCode;
+
+        return LslCodeUnknownStatus;
+    }
+
+    private static string TriggerCodeForCondition(string condition)
+    {
+        switch (condition.ToLowerInvariant())
+        {
+            case "a":
+                return "3";
+            case "v":
+                return "6";
+            case "av":
+                return "11";
+            default:
+                return "none";
+        }
+    }
+
+    private string CurrentTrialMarker(string eventName)
+    {
+        string code = CurrentTrialDef?.Code ?? "none";
+        string condition = code.Split('_')[0];
+
+        return string.Join("|", new[]
+        {
+            MarkerValue(code),
+            "event=" + MarkerValue(eventName),
+            "block=" + lslBlockNumber,
+            "trial=" + lslTrialNumber,
+            "trial_in_block=" + lslTrialInBlockNumber,
+            "condition=" + MarkerValue(condition),
+            "trigger_code=" + TriggerCodeForCondition(condition),
+            "visual_index=" + NullableIntValue(CurrentTrialDef?.VisualStimIndex),
+            "audio_index=" + NullableIntValue(CurrentTrialDef?.AudioStimIndex),
+            "audio_delivery=" + MarkerValue(CurrentTrialDef?.AudioStimDelivery),
+            "unity_time=" + Time.time.ToString("F6", CultureInfo.InvariantCulture),
+            "frame=" + Time.frameCount
+        });
     }
     //
     // public void SetExperimentType(int type)
@@ -151,10 +348,20 @@ public class TrialController3D : MonoBehaviour
         switch (trialState)
         {
             case "none":
-                if (!stateInitialized && confirmAction.IsPressed())
+                if (!startPromptShown)
+                {
+                    InstructionDisplay.ShowStartPrompt();
+                    startPromptShown = true;
+                }
+
+                if (!stateInitialized && IsConfirmPressed())
                 {
                     stateInitialized = true;
                     startButtonPressed = false;
+                    InstructionDisplay.HideAll();
+                    lslBlockNumber = 1;
+                    lslTrialNumber = 0;
+                    lslTrialInBlockNumber = 0;
 
                     TaskDef = TrialDefGenerator.GenerateTaskDef(ExperimentType);
                     AllTrialDefs = TrialDefGenerator.GenerateTrialDefs(ExperimentType, this);
@@ -173,6 +380,7 @@ public class TrialController3D : MonoBehaviour
                     if (TaskDef.StartingInstructions) 
                         await InstructionDisplay.ShowInit();
 
+                    PushLslMarker("STATUS:RUNNING");
                     InitState("ITI"); // Move to the Inter-Trial Interval state
                 }
 
@@ -201,12 +409,20 @@ public class TrialController3D : MonoBehaviour
                     {
                         CurrentTrialDef = CurrentBlockTrialDefs[0];
                         CurrentBlockTrialDefs.RemoveAt(0);
+                        lslTrialNumber++;
+                        lslTrialInBlockNumber++;
+                        if (lslTrialInBlockNumber == 1)
+                            PushLslMarker("STATUS:BLOCK_START:" + lslBlockNumber);
+                        PushLslMarker(CurrentTrialMarker("TRIAL_START"));
                         //Debug.Log("Remaining trials in block: " + CurrentBlockTrialDefs.Count);
                     }
                     else if (AllTrialDefs.Count > 0) //no trials left in current block, still more blocks left
                     {
+                        PushLslMarker("STATUS:BLOCK_END:" + lslBlockNumber);
                         blockCount++;
                         trialCountInBlock = 0;
+                        lslBlockNumber++;
+                        lslTrialInBlockNumber = 0;
                         if (CurrentTrialDef.VisualStimIndex.HasValue &&
                             VisualTargets[CurrentTrialDef.VisualStimIndex.Value].activeSelf)
                             VisualTargets[CurrentTrialDef.VisualStimIndex.Value].SetActive(false);
@@ -222,6 +438,7 @@ public class TrialController3D : MonoBehaviour
                     else // end of experiment
                     {
                         //Debug.Log("Finished eXpt!");
+                        PushLslMarker("STATUS:BLOCK_END:" + lslBlockNumber);
                         InitState("EndOfExpt");
                     }
 
@@ -259,11 +476,6 @@ public class TrialController3D : MonoBehaviour
                         InitState("Fixation");
                     else
                         InitState("StimOn");
-                }
-
-                if (confirmAction.IsPressed())
-                {
-                    //InitState("StimOn");
                 }
 
                 break;
@@ -319,8 +531,7 @@ public class TrialController3D : MonoBehaviour
                     stimOnTime = TrialStateOnsetTime;
                     if (CurrentTrialDef.Code != null)
                     {
-                        lsl_sample[0] = CurrentTrialDef.Code;
-                        lsl_outlet.push_sample(lsl_sample);
+                        PushLslMarker(CurrentTrialMarker("STIM_ON"));
                     }
                 }
 
@@ -398,6 +609,7 @@ public class TrialController3D : MonoBehaviour
                 if (!stateInitialized)
                 {
                     stateInitialized = true;
+                    PushLslMarker("STATUS:FINISHED");
                     await InstructionDisplay.ShowEndOfExp();
                 }
 
@@ -422,6 +634,34 @@ public class TrialController3D : MonoBehaviour
         TrialStateOnsetTime = Time.time;
         stateInitialized = false;
         blockEndInitialized = false;
+    }
+
+    private void OnApplicationQuit()
+    {
+        PushClosedMarkerOnce();
+    }
+
+    private void OnDestroy()
+    {
+        PushClosedMarkerOnce();
+
+        if (lsl_outlet != null)
+        {
+            lsl_outlet.Dispose();
+            lsl_outlet = null;
+            lslReady = false;
+        }
+
+        if (ownsControllerSlot && activeController == this)
+            activeController = null;
+    }
+
+    private void PushClosedMarkerOnce()
+    {
+        if (hasSentClosedMarker) return;
+
+        PushLslMarker("STATUS:CLOSED");
+        hasSentClosedMarker = true;
     }
 
     private void PrepareData()
@@ -470,7 +710,9 @@ public class TrialController3D : MonoBehaviour
 
 
         dateString = DateTime.Now.ToString("yyyy__MM_dd__HH_mm_ss");
-        SubjectDataFolder = Application.persistentDataPath + dataSubFolder + "/Subject_" + ParticipantID + "_AVLoc_Data_" + dateString;
+        SubjectDataFolder = Path.Combine(GetLocalDataRootFolder(), dataSubFolder,
+            "Subject_" + ParticipantID + "_AVLoc_Data_" + dateString);
+        Debug.Log("Saving experiment data to: " + SubjectDataFolder);
 
         trialData.folderPath = SubjectDataFolder;
         trialData.fileName = "IMRFDemo_TrialData_Subject_" + ParticipantID + "__" + dateString + ".csv";
@@ -501,6 +743,25 @@ public class TrialController3D : MonoBehaviour
                 Debug.LogError("Error creating metadata file: " + e.Message);
             }
         }
+    }
+
+    private string GetLocalDataRootFolder()
+    {
+#if UNITY_EDITOR
+        DirectoryInfo assetsDirectory = Directory.GetParent(Application.dataPath);
+        if (assetsDirectory != null) return assetsDirectory.FullName;
+#elif UNITY_STANDALONE_OSX
+        DirectoryInfo directory = new(Application.dataPath);
+        while (directory != null && !directory.Name.EndsWith(".app", StringComparison.OrdinalIgnoreCase))
+        {
+            directory = directory.Parent;
+        }
+
+        if (directory?.Parent != null) return directory.Parent.FullName;
+#endif
+
+        DirectoryInfo dataDirectory = Directory.GetParent(Application.dataPath);
+        return dataDirectory != null ? dataDirectory.FullName : Application.persistentDataPath;
     }
 
     private class TrialData : DataController
