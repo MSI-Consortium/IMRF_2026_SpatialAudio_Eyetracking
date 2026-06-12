@@ -38,6 +38,8 @@ public class TrialController3D : MonoBehaviour
     public AudioManager audioManager;
     public SpeakerPositioning SpeakerPositioning;
     public InstructionDisplay InstructionDisplay;
+    public bool ShowAprilTagSurfaceMarkers = true;
+    public AprilTagSurfaceMarkers SurfaceMarkers;
 
     public Vector3[] speakerPositions;
 
@@ -131,6 +133,8 @@ public class TrialController3D : MonoBehaviour
         foreach (GameObject go in VisualTargets) go.SetActive(false);
         FixationTarget.SetActive(false);
         InstructionDisplay = global::InstructionDisplay.GetOrCreateDefault(InstructionDisplay);
+        if (ShowAprilTagSurfaceMarkers)
+            SurfaceMarkers = global::AprilTagSurfaceMarkers.GetOrCreateDefault(SurfaceMarkers);
         startPromptShown = false;
 
         SpeakerPositioning.LoadSpeakersFromCsv();
