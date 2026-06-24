@@ -1,0 +1,26 @@
+name: spaud2
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.13
+  - pandas
+  - ca-certificates
+  - anaconda-anon-usage
+  - conda-content-trust
+  - setuptools
+  - matplotlib
+  - scipy
+  - conda-anaconda-tos[version='>=0.2.2']
+  - conda=26.3.2
+  - menuinst
+  - conda-anaconda-telemetry[version='>=0.3.0']
+  - wxpython
+  - wheel
+  - pip
+  - conda-libmamba-solver
+  - anaconda-auth
+  - pysoundfile
+  - pip:
+      - sofar
