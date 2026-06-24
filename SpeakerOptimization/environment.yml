@@ -1,0 +1,15 @@
+name: speaker_opt
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python>=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - jupyter
+  - plotly
+  - ipywidgets
+  - pip:
+      - tqdm
+      - cma
