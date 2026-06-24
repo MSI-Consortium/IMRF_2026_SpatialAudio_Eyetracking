@@ -4,6 +4,10 @@
 .vscode/
 .idea/
 
+# AI assistant local state (never commit these)
+.claude/
+.codex/
+
 # Python caches / local environments
 __pycache__/
 *.py[cod]
@@ -14,11 +18,12 @@ __pycache__/
 .venv/
 venv/
 env/
+imrf_env_notebook/
 
 # Eye-tracking and experiment outputs
 IMRF_Eyetracking/config.py
-IMRF_Eyetracking/Data_Output/
-IMRF_Eyetracking/paradigms/Data_Output/
+IMRF_Eyetracking/data_output/
+IMRF_Eyetracking/paradigms/data_output/
 IMRF_Eyetracking/paradigms/logs/
 IMRF_Eyetracking/notebooks/workshop_output/
 IMRF_Eyetracking/notebooks/reports/
