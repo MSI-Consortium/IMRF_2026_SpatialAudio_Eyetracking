@@ -1,0 +1,31 @@
+# macOS / editor-local files
+.DS_Store
+**/.DS_Store
+.vscode/
+.idea/
+
+# Python caches / local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Eye-tracking and experiment outputs
+IMRF_Eyetracking/config.py
+IMRF_Eyetracking/Data_Output/
+IMRF_Eyetracking/paradigms/Data_Output/
+IMRF_Eyetracking/paradigms/logs/
+IMRF_Eyetracking/notebooks/workshop_output/
+IMRF_Eyetracking/notebooks/reports/
+
+# Unity runtime experiment output
+IMRF_SpatialAVDemo_Unity/IMRFDemoData/
+IMRF_SpatialAVDemo_Unity/*_BurstDebugInformation_DoNotShip/
+
+# Unity local assistant settings
+IMRF_SpatialAVDemo_Unity/ProjectSettings/Packages/com.unity.ai.assistant/
